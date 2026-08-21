@@ -1,0 +1,1283 @@
+### 모듈 1 — 데이터: HTTP 로 전체 흐름 따라가기
+### .venv/bin/uvicorn main:app --reload  로 서버를 띄운 뒤 실행한다.
+
+@host = http://127.0.0.1:8000
+@id = plant-power-curated
+
+### 상태 확인
+GET {{host}}/health
+
+### 1-1  등록
+POST {{host}}/datasets
+Content-Type: application/json
+
+{
+  "dataset_id": "{{id}}",
+  "name": "3라인 주회로 전력 24시간",
+  "uri": "data/samples/plant_power_curated.csv",
+  "source_format": "CSV",
+  "modality": "TIME_SERIES",
+  "collected_from": "LINE-3 / PM-MAIN-01"
+}
+
+### 1-1  프로파일 — 판단 없이 사실만
+POST {{host}}/datasets/{{id}}/profile
+
+### 1-3  스키마 초안 (추론기가 찍은 것. 그대로 쓰면 안 된다)
+GET {{host}}/datasets/{{id}}/schema/draft
+
+### 1-2, 1-3  스키마 확정 — 이후 모든 단계의 계약
+PUT {{host}}/datasets/{{id}}/schema
+Content-Type: application/json
+
+{
+  "fields": [
+    {"name": "timestamp",           "type": "TIMESTAMP", "role": "TIME_INDEX"},
+    {"name": "meter_id",            "type": "CATEGORY",  "role": "METADATA"},
+    {"name": "batch_id",            "type": "CATEGORY",  "role": "GROUP"},
+    {"name": "product_code",        "type": "CATEGORY",  "role": "METADATA"},
+    {"name": "active_power_kw",     "type": "REAL", "role": "FEATURE", "unit": "kW",
+     "value_range": {"minimum": 0.0, "maximum": 400.0}},
+    {"name": "reactive_power_kvar", "type": "REAL", "role": "FEATURE", "unit": "kvar",
+     "value_range": {"minimum": 0.0, "maximum": 400.0}},
+    {"name": "current_a",           "type": "REAL", "role": "FEATURE", "unit": "A",
+     "value_range": {"minimum": 0.0, "maximum": 600.0}},
+    {"name": "voltage_v",           "type": "REAL", "role": "FEATURE", "unit": "V",
+     "value_range": {"minimum": 300.0, "maximum": 440.0}},
+    {"name": "temperature_c",       "type": "REAL", "role": "FEATURE", "unit": "C",
+     "required": false, "value_range": {"minimum": -20.0, "maximum": 120.0}},
+    {"name": "spindle_rpm",         "type": "REAL", "role": "FEATURE", "unit": "rpm",
+     "value_range": {"minimum": 0.0, "maximum": 4000.0}},
+    {"name": "condition",           "type": "CATEGORY", "role": "LABEL"},
+    {"name": "condition_review",    "type": "CATEGORY", "role": "METADATA", "required": false}
+  ]
+}
+
+### 1-4  센서 신호 — 고착 / 포화 / 범위 이탈
+POST {{host}}/datasets/{{id}}/inspections/signal
+Content-Type: application/json
+
+{}
+
+### 1-5  시간축 — 역순 / 중복 / 공백
+POST {{host}}/datasets/{{id}}/inspections/time-axis
+Content-Type: application/json
+
+{"expected_interval_seconds": 10.0}
+
+### 1-6  라벨 정의 — 기준 없는 라벨은 거부된다
+PUT {{host}}/datasets/{{id}}/label-space
+Content-Type: application/json
+
+{
+  "field_name": "condition",
+  "definitions": [
+    {"name": "NORMAL",   "meaning": "정격 부하 범위 안에서 운전 중이며 알람이 없는 상태",
+     "decided_by": "설비운영팀 SOP-PWR-03"},
+    {"name": "OVERLOAD", "meaning": "유효전력이 정격의 110% 를 5초 이상 초과한 상태",
+     "decided_by": "설비운영팀 SOP-PWR-03"},
+    {"name": "FAULT",    "meaning": "보호 계전기가 동작했거나 설비가 정지한 상태",
+     "decided_by": "보전팀 고장이력 시스템"}
+  ]
+}
+
+### 1-8  분할 — RANDOM 을 시도하면 422 로 막힌다
+POST {{host}}/datasets/{{id}}/partitions
+Content-Type: application/json
+
+{
+  "strategy": "TIME_ORDERED",
+  "train": 0.7, "validation": 0.15, "test": 0.15,
+  "time_field": "timestamp"
+}
+
+### 1-7  학습 데이터 설계 — 정규화 통계는 train 에서만
+PUT {{host}}/datasets/{{id}}/training-spec
+Content-Type: application/json
+
+{
+  "feature_fields": ["active_power_kw", "reactive_power_kvar", "current_a",
+                     "voltage_v", "temperature_c", "spindle_rpm"],
+  "label_field": "condition",
+  "window": {"length": 30, "stride": 30, "interval_seconds": 10.0},
+  "normalization": {"method": "ZSCORE"},
+  "fit_normalization": true
+}
+
+### 1-9  대표성 — 지금 현장을 닮았는가
+POST {{host}}/datasets/{{id}}/inspections/representativeness
+Content-Type: application/json
+
+{
+  "observed_uri": "data/samples/plant_power_recent_stable.csv",
+  "observed_collected_from": "LINE-3 / 3월 2주차"
+}
+
+### 1-9  대표성 — 여름 현장과 비교하면 FAILED
+POST {{host}}/datasets/{{id}}/inspections/representativeness
+Content-Type: application/json
+
+{
+  "observed_uri": "data/samples/plant_power_recent_shifted.csv",
+  "observed_collected_from": "LINE-3 / 7월 현장 표본"
+}
+
+### 1-10  학습 착수 판정
+POST {{host}}/datasets/{{id}}/readiness
+Content-Type: application/json
+
+{"allow_warnings": true, "max_warning_count": 10}
+
+### 1-10  현재 상태
+GET {{host}}/datasets/{{id}}
+
+### 1-10  판정 되돌리기 — 이유가 없으면 거부된다
+POST {{host}}/datasets/{{id}}/reopen
+Content-Type: application/json
+
+{"reason": "전압 센서 교체 후 재수집분 반영"}
+
+
+###############################################################################
+### 모듈 2 — 데이터 품질: 같은 파일에 다른 질문을 한다
+###############################################################################
+
+@qa = qa-2026-04
+
+### 2-1  품질 평가 시작 (모듈 1을 통과한 Dataset 을 대상으로)
+POST {{host}}/datasets/{{id}}/quality-assessments
+Content-Type: application/json
+
+{"assessment_id": "{{qa}}"}
+
+### 2-2  결측 — 값이 없다 (은폐된 결측까지)
+POST {{host}}/quality-assessments/{{qa}}/dimensions/completeness
+Content-Type: application/json
+
+{}
+
+### 2-3  이상치 — 값이 말이 안 된다
+POST {{host}}/quality-assessments/{{qa}}/dimensions/validity
+Content-Type: application/json
+
+{"normal_label": "NORMAL"}
+
+### 2-4  라벨 오류 — 규칙 없이 호출하면 그 사실이 CRITICAL 로 돌아온다
+POST {{host}}/quality-assessments/{{qa}}/dimensions/label-quality
+Content-Type: application/json
+
+{}
+
+### 2-4  라벨 오류 — 현장 규칙을 넣으면 모순이 드러난다
+POST {{host}}/quality-assessments/{{qa}}/dimensions/label-quality
+Content-Type: application/json
+
+{
+  "rules": [
+    {"label": "FAULT", "field_name": "active_power_kw", "expected_max": 30.0,
+     "description": "보호 계전기가 동작하면 부하가 실제로 차단된다"},
+    {"label": "NORMAL", "field_name": "active_power_kw", "expected_max": 240.0,
+     "description": "정격의 110% 를 넘는 구간을 NORMAL 이라 부를 수 없다"},
+    {"label": "OVERLOAD", "field_name": "active_power_kw", "expected_min": 192.0,
+     "description": "과부하 판정 기준 (SOP-PWR-03)"}
+  ]
+}
+
+### 2-5  불균형 — baseline 정확도가 지표를 무너뜨린다
+POST {{host}}/quality-assessments/{{qa}}/dimensions/balance
+Content-Type: application/json
+
+{}
+
+### 2-6  잡음 — 한 채널이 무너지면 그 축의 점수가 무너진다
+POST {{host}}/quality-assessments/{{qa}}/dimensions/noise
+Content-Type: application/json
+
+{}
+
+### 2-7  중복 — 모듈 1의 시간축 검사가 못 잡는 것
+POST {{host}}/quality-assessments/{{qa}}/dimensions/uniqueness
+Content-Type: application/json
+
+{}
+
+### 2-8  종합 점수 + 학습 영향 (표본 수 언어로 환산)
+POST {{host}}/quality-assessments/{{qa}}/score
+Content-Type: application/json
+
+{
+  "label_rules": [
+    {"label": "FAULT", "field_name": "active_power_kw", "expected_max": 30.0,
+     "description": "보호 계전기가 동작하면 부하가 실제로 차단된다"}
+  ]
+}
+
+### 2-9  조치 기록 — 근거가 없으면 422
+POST {{host}}/quality-assessments/{{qa}}/remediations
+Content-Type: application/json
+
+{
+  "kind": "EXCLUDE_SEGMENT",
+  "dimension": "COMPLETENESS",
+  "target": "temperature_c / LOT 3개 구간",
+  "affected_rows": 259,
+  "rationale": "결측이 3개 LOT 에 몰려 있어 보간하면 그 구간의 현실이 조작된다",
+  "decided_by": "데이터팀 · 설비운영팀 합의 (2026-04-10)"
+}
+
+### 2-9  조치 후 게이트 — 재측정하지 않으면 막힌다
+POST {{host}}/quality-assessments/{{qa}}/gate
+Content-Type: application/json
+
+{}
+
+### 2-9  두 평가 비교
+POST {{host}}/quality-comparisons
+Content-Type: application/json
+
+{
+  "before_assessment_id": "qa-before",
+  "after_assessment_id": "qa-after",
+  "before_label": "조치 전",
+  "after_label": "조치 후"
+}
+
+### 2-10  Data Quality Gate
+POST {{host}}/quality-assessments/{{qa}}/gate
+Content-Type: application/json
+
+{}
+
+### 2-10  안전 라인 기준 — 같은 데이터, 다른 판정
+POST {{host}}/quality-assessments/{{qa}}/gate
+Content-Type: application/json
+
+{
+  "minimum_overall_score": 99.5,
+  "minimum_dimension_score": 96.0,
+  "blocking_dimensions": ["COMPLETENESS", "VALIDITY", "LABEL_QUALITY",
+                          "BALANCE", "NOISE", "UNIQUENESS"]
+}
+
+### 2-10  현재 상태
+GET {{host}}/quality-assessments/{{qa}}
+
+### 2-10  판정 되돌리기
+POST {{host}}/quality-assessments/{{qa}}/reopen
+Content-Type: application/json
+
+{"reason": "전압 계측 배선 교체 후 재수집"}
+
+
+###############################################################################
+### 모듈 3 — 모델: 학습은 오래 걸린다. 요청이 그것을 붙잡지 않는다 (CLAUDE.md §11)
+###############################################################################
+
+@run = run-2026-05-11
+@mid = plant-power-model
+
+### 3-1  학습 준비 — 게이트 확인 + 텐서 + 구조 프로파일
+### 게이트를 통과하지 않은 데이터면 여기서 409 로 막힌다.
+POST {{host}}/training-runs
+Content-Type: application/json
+
+{
+  "run_id": "{{run}}",
+  "dataset_id": "{{mid}}",
+  "assessment_id": "qa-{{mid}}",
+  "architecture": {
+    "kind": "CNN1D",
+    "input_shape": [30, 6],
+    "class_count": 3,
+    "hidden_channels": [16, 32],
+    "kernel_size": 5
+  },
+  "config": {
+    "epochs": 10,
+    "batch_size": 32,
+    "learning_rate": 0.003,
+    "seed": 42,
+    "early_stopping": {"patience": 3}
+  },
+  "windowing": {
+    "window_length": 30,
+    "stride": 30,
+    "label_priority": [["FAULT", 0.3], ["OVERLOAD", 0.5]],
+    "default_label": "NORMAL"
+  }
+}
+
+### 3-2  층별 계산량 — 파라미터와 MAC
+GET {{host}}/training-runs/{{run}}/architecture
+
+### 3-5  학습 시작 — 202 가 즉시 돌아온다. 기다리지 않는다.
+POST {{host}}/training-runs/{{run}}/start
+
+### 3-5  Job 상태 — 진행 상황은 물어본다
+GET {{host}}/training-runs/{{run}}
+
+### 3-6, 3-7  학습 곡선 — 배우고 있는가, 외우고 있는가
+GET {{host}}/training-runs/{{run}}/curve
+
+### 3-9  평가 — 정확도 뒤의 클래스별 성적표
+POST {{host}}/training-runs/{{run}}/evaluations
+Content-Type: application/json
+
+{
+  "split": "test",
+  "policy": {
+    "critical_labels": ["FAULT"],
+    "min_critical_recall": 0.9
+  }
+}
+
+### 3-10  현장 홀드아웃 — 다른 날 데이터로 다시 본다
+POST {{host}}/training-runs/{{run}}/field-evaluations
+Content-Type: application/json
+
+{
+  "field_uri": "data/samples/plant_power_model_field.csv",
+  "policy": {"critical_labels": ["FAULT"], "min_critical_recall": 0.9}
+}
+
+### 3-10  승인 판정 — 정확도와 지연시간을 함께 본다
+POST {{host}}/training-runs/{{run}}/acceptance
+Content-Type: application/json
+
+{
+  "split": "field",
+  "evaluation": {"critical_labels": ["FAULT"], "min_critical_recall": 0.9},
+  "latency_p95_ms": 30.0
+}
+
+### 3-10  지연시간 예산을 조이면 정확도와 무관하게 막힌다
+POST {{host}}/training-runs/{{run}}/acceptance
+Content-Type: application/json
+
+{"split": "test", "latency_p95_ms": 0.001}
+
+### 3-10  판정 되돌리기
+POST {{host}}/training-runs/{{run}}/reopen
+Content-Type: application/json
+
+{"reason": "현장 재수집분으로 재평가"}
+
+### 학습 목록
+GET {{host}}/training-runs
+
+# =============================================================================
+# 모듈 4 — 최적화
+# 승인받은 모델을 디바이스에 올릴 수 있는 형태로 바꾸고, 예산 안에서 고른다.
+# =============================================================================
+
+@opt = opt-power
+
+### 4-1  최적화 시작 — 승인받지 않은 모델이면 여기서 막힌다
+POST {{host}}/optimization-runs
+Content-Type: application/json
+
+{
+  "run_id": "{{opt}}",
+  "training_run_id": "{{run}}",
+  "split": "test"
+}
+
+### 4-1  기준 측정 — 숫자와 함께 '어떻게 쟀는지'가 돌아온다
+POST {{host}}/optimization-runs/{{opt}}/baseline
+Content-Type: application/json
+
+{
+  "protocol": {"warmup_runs": 30, "measured_runs": 300, "batch_size": 1, "threads": 1}
+}
+
+### 4-1  프로토콜을 잘못 잡으면 소견이 붙는다 (워밍업 없음 + 배치 32)
+POST {{host}}/optimization-runs/{{opt}}/baseline
+Content-Type: application/json
+
+{
+  "protocol": {"warmup_runs": 0, "measured_runs": 10, "batch_size": 32, "threads": 8}
+}
+
+### 4-2  TorchScript — 파이썬을 벗어난 그래프
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "TORCHSCRIPT", "precision": "FP32", "equivalence_samples": 128}
+
+### 4-3  ONNX — 프레임워크 중립 그래프
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "ONNX", "precision": "FP32", "equivalence_samples": 128}
+
+### 4-4  TFLite FP32 — PyTorch → Keras → TFLite
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "TFLITE", "precision": "FP32", "equivalence_samples": 128}
+
+### 4-6  TFLite FP16
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "TFLITE", "precision": "FP16", "equivalence_samples": 128}
+
+### 4-7  TFLite INT8 — 대표 데이터는 train 분할에서 뽑는다
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "TFLITE", "precision": "INT8", "equivalence_samples": 128}
+
+### 4-7  지원하지 않는 조합은 409 — 조용히 다른 것을 만들지 않는다
+POST {{host}}/optimization-runs/{{opt}}/candidates
+Content-Type: application/json
+
+{"runtime": "ONNX", "precision": "INT8"}
+
+### §11  변환을 백그라운드로 — 응답은 즉시 202
+POST {{host}}/optimization-runs/{{opt}}/candidates:async
+Content-Type: application/json
+
+{"runtime": "TFLITE", "precision": "INT8"}
+
+### §11  진행 상황을 물어본다
+GET {{host}}/optimization-runs/{{opt}}
+
+### 4-5  크기를 '가중치 + 오버헤드'로 쪼개 본다
+GET {{host}}/optimization-runs/{{opt}}/artifacts
+
+### 4-8  정확도와 지연시간을 한 표에
+GET {{host}}/optimization-runs/{{opt}}/tradeoff
+
+### 4-9  병목 분석 — 두 숫자는 데이터시트에서 온다
+POST {{host}}/optimization-runs/{{opt}}/roofline
+Content-Type: application/json
+
+{
+  "device": {
+    "name": "edge-mcu",
+    "peak_gmac_per_second": 2.0,
+    "memory_bandwidth_gb_per_second": 1.6
+  }
+}
+
+### 4-9  같은 모델, 대역폭이 좁은 보드 — 병목이 바뀐다
+POST {{host}}/optimization-runs/{{opt}}/roofline
+Content-Type: application/json
+
+{
+  "device": {
+    "name": "대역폭이 좁은 보드",
+    "peak_gmac_per_second": 8.0,
+    "memory_bandwidth_gb_per_second": 0.4
+  }
+}
+
+### 4-10  선택 — 예산을 만족하는 것 중 가장 정확한 것
+POST {{host}}/optimization-runs/{{opt}}/selection
+Content-Type: application/json
+
+{
+  "budget": {
+    "name": "전력 감시 설비",
+    "latency_p95_ms": 30.0,
+    "storage_kib": 256.0,
+    "activation_kib": 64.0,
+    "min_macro_recall": 0.9,
+    "max_accuracy_drop": 0.02,
+    "max_class_recall_drop": 0.05
+  },
+  "objective": "ACCURACY"
+}
+
+### 4-10  판정 되돌리기 — 이유 없이는 안 된다
+POST {{host}}/optimization-runs/{{opt}}/reopen
+Content-Type: application/json
+
+{"reason": "설비 교체로 사이클 타임이 10ms 로 줄었다"}
+
+### 4-10  예산을 조이면 다른 것이 선택된다
+POST {{host}}/optimization-runs/{{opt}}/selection
+Content-Type: application/json
+
+{
+  "budget": {"name": "새 설비", "latency_p95_ms": 10.0, "storage_kib": 10.0},
+  "objective": "SIZE"
+}
+
+### 4-10  예산을 만족하는 후보가 없으면 아무것도 고르지 않는다
+POST {{host}}/optimization-runs/{{opt}}/reopen
+Content-Type: application/json
+
+{"reason": "불가능한 예산을 넣어 본다"}
+
+###
+POST {{host}}/optimization-runs/{{opt}}/selection
+Content-Type: application/json
+
+{"budget": {"name": "불가능", "latency_p95_ms": 0.0001}}
+
+### 판정서 다시 보기
+GET {{host}}/optimization-runs/{{opt}}/selection
+
+### 최적화 목록
+GET {{host}}/optimization-runs
+
+# =============================================================================
+# 모듈 5 — 운영
+# 배포하고, 판단을 로그로 남기고, 창 단위로 지켜보고, 이상하면 멈춘다.
+# =============================================================================
+
+@dep = dep-line3
+@watch = watch-dep-line3
+
+### 5-1  배포 — 결과물·전처리·기준·관측이 함께 나간다
+POST {{host}}/deployments
+Content-Type: application/json
+
+{
+  "deployment_id": "{{dep}}",
+  "optimization_run_id": "{{opt}}",
+  "training_run_id": "{{run}}",
+  "target": {
+    "kind": "DEVICE_GROUP",
+    "identifier": "LINE-3",
+    "name": "3라인 전력 감시",
+    "device_count": 3
+  },
+  "watch_id": "{{watch}}",
+  "released_at": "2026-05-19 23:00:00",
+  "note": "첫 배포"
+}
+
+### 5-1  전처리를 안 들고 가면 점검에 걸린다 (training_run_id 생략)
+POST {{host}}/deployments
+Content-Type: application/json
+
+{
+  "deployment_id": "dep-no-preprocessing",
+  "optimization_run_id": "{{opt}}",
+  "target": {"kind": "DEVICE", "identifier": "D-1"}
+}
+
+### 5-1  첫 배포를 1,200대에 한 번에 — 되돌릴 곳이 없다
+POST {{host}}/deployments
+Content-Type: application/json
+
+{
+  "deployment_id": "dep-too-wide",
+  "optimization_run_id": "{{opt}}",
+  "training_run_id": "{{run}}",
+  "target": {"kind": "FLEET", "identifier": "ALL", "device_count": 1200}
+}
+
+### 5-2  새 버전 — 모델 버전은 같고 배포 버전만 올라간다
+POST {{host}}/deployments/{{dep}}/versions
+Content-Type: application/json
+
+{
+  "optimization_run_id": "{{opt}}",
+  "training_run_id": "{{run}}",
+  "artifact_label": "TFLITE/INT8",
+  "note": "플래시가 모자라 INT8 로 교체",
+  "released_at": "2026-05-21 12:00:00",
+  "require_selected": false
+}
+
+### 5-2  배포 이력 — 언제 무엇이 올라갔는가
+GET {{host}}/deployments/{{dep}}
+
+### 5-3  디바이스가 판단 기록을 올린다
+POST {{host}}/deployments/{{dep}}/logs
+Content-Type: application/json
+
+{
+  "records": [
+    {
+      "occurred_at": "2026-05-20 00:04:50",
+      "device_id": "DEV-01",
+      "deployment_version": 1,
+      "predicted_label": "NORMAL",
+      "confidence": 0.882,
+      "latency_ms": 0.0282,
+      "input_digest": "ac8dfc9629dc0b89"
+    },
+    {
+      "occurred_at": "2026-05-20 00:05:20",
+      "device_id": "DEV-02",
+      "deployment_version": 1,
+      "predicted_label": "OVERLOAD",
+      "confidence": 0.771,
+      "latency_ms": 0.0307,
+      "input_digest": "1f0b7c2e5a934d61",
+      "ground_truth": "OVERLOAD"
+    }
+  ]
+}
+
+### 5-3  로그가 반쯤 비어 있으면 소견이 붙는다 (버전·지문 없음)
+POST {{host}}/deployments/{{dep}}/logs
+Content-Type: application/json
+
+{
+  "records": [
+    {
+      "occurred_at": "2026-05-20 00:06:00",
+      "device_id": "DEV-01",
+      "deployment_version": 1,
+      "predicted_label": "NORMAL",
+      "confidence": 0.9,
+      "latency_ms": 0.03
+    }
+  ]
+}
+
+### 5-6  기준 재고정 — 평가 분포가 아니라 현장 안정 구간으로
+POST {{host}}/deployments/{{dep}}/baseline
+Content-Type: application/json
+
+{
+  "window": {
+    "label": "05-20 00시",
+    "started_at": "2026-05-20 00:00:00",
+    "ended_at": "2026-05-20 07:59:59"
+  },
+  "reason": "배포 직후 안정 구간"
+}
+
+### 5-4~5-7  창 하나 관측 — 지연시간·예측분포·입력분포를 한 번에
+POST {{host}}/deployments/{{dep}}/observations
+Content-Type: application/json
+
+{
+  "window": {
+    "label": "05-23 00시",
+    "started_at": "2026-05-23 00:00:00",
+    "ended_at": "2026-05-23 07:59:59"
+  },
+  "latency_policy": {"cycle_budget_ms": 30.0, "max_regression_ratio": 12.0},
+  "mix_policy": {"max_shift": 0.15, "critical_labels": ["FAULT"]},
+  "drift_policy": {"max_psi": 0.2, "max_out_of_range_ratio": 0.01}
+}
+
+### 5-5  한 대만 보기 — 전부인가 한 대인가
+POST {{host}}/deployments/{{dep}}/observations
+Content-Type: application/json
+
+{
+  "window": {
+    "label": "05-23 00시 DEV-02",
+    "started_at": "2026-05-23 00:00:00",
+    "ended_at": "2026-05-23 07:59:59",
+    "device_id": "DEV-02"
+  },
+  "latency_policy": {"cycle_budget_ms": 30.0},
+  "open_incident": false
+}
+
+### 5-4  시간선 — 창들을 시간 순으로
+GET {{host}}/health-watches/{{watch}}/timeline
+
+### 5-4  언제부터인가 — 스파이크와 지속을 구분한다
+POST {{host}}/health-watches/{{watch}}/onset
+Content-Type: application/json
+
+{"metric": "INPUT_PSI", "threshold": 0.2, "consecutive": 3}
+
+### 5-4  한 창만 보면 스파이크도 사건이 된다
+POST {{host}}/health-watches/{{watch}}/onset
+Content-Type: application/json
+
+{"metric": "INPUT_PSI", "threshold": 0.2, "consecutive": 1}
+
+### 5-5  지연시간은 하루 뒤에 무너졌다 — 다른 원인이다
+POST {{host}}/health-watches/{{watch}}/onset
+Content-Type: application/json
+
+{"metric": "LATENCY_P95", "threshold": 0.05, "consecutive": 3}
+
+### 5-8  격리 — 이유를 비우면 최근 관측에서 근거를 찾아 온다
+POST {{host}}/deployments/{{dep}}/quarantine
+Content-Type: application/json
+
+{}
+
+### 5-8  사건 목록
+GET {{host}}/health-watches/{{watch}}/incidents?only_open=true
+
+### 5-8  사건 닫기 — 무엇을 해서 끝났는지 없으면 또 일어난다
+POST {{host}}/health-watches/{{watch}}/incidents/inc-{{watch}}-05-23 00시/resolution
+Content-Type: application/json
+
+{"resolution": "여름 데이터로 재학습 후 v2 배포"}
+
+### 5-8  격리 해제 — 무엇을 확인했는지 적는다
+POST {{host}}/deployments/{{dep}}/resume
+Content-Type: application/json
+
+{"reason": "DEV-02 팬 교체 완료, 온도 정상 복귀 확인"}
+
+### 5-9  그림자 비교 — 새 모델의 답은 쓰지 않는다
+POST {{host}}/deployments/{{dep}}/shadow
+Content-Type: application/json
+
+{
+  "window": {
+    "label": "4일차",
+    "started_at": "2026-05-23 00:00:00",
+    "ended_at": "2026-05-23 23:59:59"
+  },
+  "candidate_artifact_id": "mv-power-opt-cnn1d-s42-tflite-int8",
+  "policy": {"min_sample_count": 500, "min_labeled_count": 100, "require_labels": true}
+}
+
+### 5-10  롤백 — 결과는 새 버전이다. 번호는 줄지 않는다
+POST {{host}}/deployments/{{dep}}/rollback
+Content-Type: application/json
+
+{
+  "to_version": 1,
+  "reason": "v2 배포 후 FAULT 재현율 붕괴",
+  "occurred_at": "2026-05-23 09:00:00"
+}
+
+### 5-10  돌아갈 곳이 없으면 404
+POST {{host}}/deployments/{{dep}}/rollback
+Content-Type: application/json
+
+{"to_version": 9, "reason": "없는 버전으로"}
+
+### 5-11  재학습 판정 — "필요한가" 가 아니라 "지금 시작할 수 있는가"
+POST {{host}}/health-watches/{{watch}}/retraining
+Content-Type: application/json
+
+{
+  "policy": {
+    "drift_psi_threshold": 0.2,
+    "sustained_windows": 3,
+    "min_new_labels": 500,
+    "min_labels_per_class": 30
+  }
+}
+
+### 5-11  소수 클래스 라벨이 모자라면 막힌다
+POST {{host}}/health-watches/{{watch}}/retraining
+Content-Type: application/json
+
+{"policy": {"min_labels_per_class": 100}}
+
+### 5-11  정답이 있으면 가장 강한 근거가 된다
+POST {{host}}/health-watches/{{watch}}/retraining
+Content-Type: application/json
+
+{
+  "measured_accuracy": 0.729,
+  "policy": {"measured_accuracy_floor": 0.80}
+}
+
+### 관측 목록
+GET {{host}}/health-watches
+
+### 배포 목록
+GET {{host}}/deployments
+
+# =============================================================================
+# 모듈 6 — AWS
+# 수천 대의 데이터를 모으고, 다시 학습하고, 현장으로 내보내고, 되돌린다.
+#
+# 주의: 서버의 기본 FleetContainer 에는 AWS 어댑터가 붙어 있지 않다.
+#       자격증명 없이 서버를 띄우는 것만으로 boto3 세션이 열리면 안 되기 때문이다.
+#       실제로 쓰려면 set_fleet_container(FleetContainer.with_aws(...)) 로 갈아끼운다.
+#       안 끼운 상태에서 부르면 409 가 돌아온다 — 그것도 확인해 볼 만하다.
+# =============================================================================
+
+@fleet = line3
+@rollout = ro-1
+
+### 6-1  플릿 생성 + 디바이스 등록
+POST {{host}}/fleets
+Content-Type: application/json
+
+{
+  "fleet_id": "{{fleet}}",
+  "name": "3라인 전력 감시",
+  "devices": [
+    {"device_id": "DEV-00", "group": "pilot",  "current_version": "v1.0.0", "last_seen_at": "2026-05-23 09:00:00"},
+    {"device_id": "DEV-01", "group": "pilot",  "current_version": "v1.0.0", "last_seen_at": "2026-05-23 09:00:00"},
+    {"device_id": "DEV-02", "group": "line-a", "current_version": "v1.0.0", "last_seen_at": "2026-05-23 09:00:00"},
+    {"device_id": "DEV-03", "group": "line-a", "current_version": "v1.0.0", "last_seen_at": "2026-05-23 09:00:00"}
+  ]
+}
+
+### 6-1  업링크 — 묶어서 올린다
+POST {{host}}/fleets/{{fleet}}/uplinks
+Content-Type: application/json
+
+{
+  "batch": {
+    "device_id": "DEV-02",
+    "kind": "INFERENCE_LOG",
+    "window_start": "2026-05-23 09:00:00",
+    "window_end": "2026-05-23 09:59:59",
+    "record_count": 360,
+    "payload_bytes": 72000,
+    "checksum": "c0ffee",
+    "fields": ["occurred_at", "predicted_label", "confidence", "latency_ms"]
+  },
+  "body_base64": "eyJyZWNvcmQiOjF9"
+}
+
+### 6-1  개인정보가 섞이면 저장하지 않는다 — 되돌릴 수 없는 유일한 실수
+POST {{host}}/fleets/{{fleet}}/uplinks
+Content-Type: application/json
+
+{
+  "batch": {
+    "device_id": "DEV-02",
+    "window_start": "2026-05-23 10:00:00",
+    "window_end": "2026-05-23 10:59:59",
+    "record_count": 360,
+    "payload_bytes": 72000,
+    "checksum": "c0ffee",
+    "fields": ["occurred_at", "predicted_label", "operator_name"]
+  },
+  "body_base64": "eyJyZWNvcmQiOjF9"
+}
+
+### 6-2  키 설계 점검 — 이 조건으로 얼마나 좁혀지는가
+POST {{host}}/fleets/{{fleet}}/lake
+Content-Type: application/json
+
+{
+  "layout": {"prefix": "uplinks", "order": ["kind", "device", "date", "hour"]},
+  "filters": {"kind": "inference_log", "device": "DEV-02", "date": "2026-05-23"}
+}
+
+### 6-2  파티션이 없으면 전부 훑어야 한다
+POST {{host}}/fleets/{{fleet}}/lake
+Content-Type: application/json
+
+{"layout": {"prefix": "uplinks", "order": ["kind"]}, "filters": {"kind": "inference_log"}}
+
+### 6-3  플릿 집계 — 목록이 아니라 여섯 줄
+GET {{host}}/fleets/{{fleet}}
+
+### 6-3  모듈 5 의 격리를 플릿에 반영한다
+POST {{host}}/fleets/{{fleet}}/devices/DEV-03/status
+Content-Type: application/json
+
+{"status": "QUARANTINED", "note": "모듈 5 격리 — 입력 드리프트"}
+
+### 6-4  현장 데이터로 학습 데이터셋을 만든다 (격리된 디바이스는 자동으로 빠진다)
+POST {{host}}/fleets/{{fleet}}/datasets
+Content-Type: application/json
+
+{
+  "build_id": "build-2026-05-24",
+  "window": {
+    "started_at": "2026-05-22 00:00:00",
+    "ended_at": "2026-05-23 23:59:59",
+    "reason": "드리프트 시작 이후 구간 (실습 5-7)"
+  },
+  "record_counts": {"DEV-00": 3000, "DEV-01": 3000, "DEV-02": 3000},
+  "labeled_counts": {"DEV-00": 300, "DEV-01": 300, "DEV-02": 300},
+  "label_distribution": {"NORMAL": 600, "OVERLOAD": 250, "FAULT": 50}
+}
+
+### 6-5  클라우드 학습 제출 — 202, 기다리지 않는다
+POST {{host}}/cloud-training-jobs
+Content-Type: application/json
+
+{
+  "job_id": "train-2026-05-24",
+  "dataset_uri": "s3://ondevice-ai-lake/datasets/build=build-2026-05-24/",
+  "output_uri": "s3://ondevice-ai-artifacts/train-2026-05-24/",
+  "compute": {
+    "instance_type": "ml.m5.large",
+    "instance_count": 1,
+    "max_runtime_seconds": 3600,
+    "hourly_cost_usd": 0.13
+  },
+  "hyperparameters": {"epochs": "10", "batch_size": "32"}
+}
+
+### 6-5  예산을 넘으면 제출 자체를 안 한다 — 멈추면 이미 과금됐다
+POST {{host}}/cloud-training-jobs
+Content-Type: application/json
+
+{
+  "job_id": "train-too-expensive",
+  "dataset_uri": "s3://ondevice-ai-lake/datasets/build=build-2026-05-24/",
+  "output_uri": "s3://ondevice-ai-artifacts/x/",
+  "compute": {
+    "instance_type": "ml.p3.8xlarge",
+    "instance_count": 4,
+    "max_runtime_seconds": 28800,
+    "hourly_cost_usd": 17.6
+  }
+}
+
+### 6-5  상태를 물어본다
+GET {{host}}/cloud-training-jobs/train-2026-05-24
+
+### 6-6  릴리스 등록 — 파일이 아니라 묶음이다
+POST {{host}}/fleets/{{fleet}}/releases
+Content-Type: application/json
+
+{
+  "bundle": {
+    "release_id": "rel-v2",
+    "version": "v2.0.0",
+    "model_version_id": "mv-power-opt-cnn1d-s42",
+    "artifact_uri": "s3://ondevice-ai-artifacts/v2.0.0/model.tflite",
+    "artifact_bytes": 11724,
+    "checksum": "deadbeefdeadbeefdeadbeefdeadbeef",
+    "runtime": "TFLITE",
+    "precision": "FP16",
+    "class_labels": ["FAULT", "OVERLOAD", "NORMAL"],
+    "input_fields": ["active_power_kw", "temperature_c"],
+    "normalization": {"active_power_kw": [147.8, 39.8]},
+    "expected_p95_ms": 0.0031,
+    "expected_class_mix": {"NORMAL": 0.78, "OVERLOAD": 0.21, "FAULT": 0.01},
+    "sample_interval_seconds": 10,
+    "window_length": 30,
+    "source_build_id": "build-2026-05-24",
+    "source_job_id": "train-2026-05-24"
+  }
+}
+
+### 6-6  전처리가 빠지면 점검에 걸린다 — 전처리는 모델의 일부다
+POST {{host}}/fleets/{{fleet}}/releases
+Content-Type: application/json
+
+{
+  "bundle": {
+    "release_id": "rel-v2-bad", "version": "v2.0.1",
+    "model_version_id": "mv-1",
+    "artifact_uri": "s3://a/model.tflite", "artifact_bytes": 11724,
+    "checksum": "abc", "runtime": "TFLITE", "precision": "FP16",
+    "class_labels": ["FAULT", "OVERLOAD", "NORMAL"],
+    "source_build_id": "build-2026-05-24"
+  }
+}
+
+### 6-7  canary 승격
+POST {{host}}/fleets/{{fleet}}/channels
+Content-Type: application/json
+
+{"version": "v2.0.0", "channel": "CANARY"}
+
+### 6-7  canary 를 안 거치고 stable 로 가면 409
+POST {{host}}/fleets/{{fleet}}/channels
+Content-Type: application/json
+
+{"version": "v2.0.1", "channel": "STABLE"}
+
+### 6-8  롤아웃 계획 — 202, 알린 것이지 도착한 것이 아니다
+POST {{host}}/fleets/{{fleet}}/rollouts
+Content-Type: application/json
+
+{
+  "rollout_id": "{{rollout}}",
+  "version": "v2.0.0",
+  "wave_sizes": [2, 8, 9999],
+  "group_order": ["pilot", "line-a", "line-b"],
+  "occurred_at": "2026-05-24 12:00:00"
+}
+
+### 6-8  첫 단계가 너무 크면 422
+POST {{host}}/fleets/{{fleet}}/rollouts
+Content-Type: application/json
+
+{"rollout_id": "ro-wide", "version": "v2.0.0", "wave_sizes": [999, 9999]}
+
+### 6-8  디바이스 응답을 걷는다 — 응답 없는 것은 PENDING 이다
+POST {{host}}/rollouts/{{rollout}}/collect
+Content-Type: application/json
+
+{"occurred_at": "2026-05-24 12:30:00"}
+
+### 6-8  다음 단계로
+POST {{host}}/rollouts/{{rollout}}/advance
+Content-Type: application/json
+
+{"fleet_id": "{{fleet}}", "occurred_at": "2026-05-24 13:00:00"}
+
+### 6-8  디바이스가 보고한 버전을 플릿에 반영한다
+POST {{host}}/rollouts/{{rollout}}/apply
+Content-Type: application/json
+
+{"fleet_id": "{{fleet}}", "seen_at": "2026-05-24 13:30:00"}
+
+### 6-8  사람이 직접 멈춘다 — 현장 연락이 지표보다 빠를 때가 있다
+POST {{host}}/rollouts/{{rollout}}/halt
+Content-Type: application/json
+
+{"reason": "현장에서 알람이 늘었다는 연락", "occurred_at": "2026-05-24 14:00:00"}
+
+### 6-9  되돌리기 — 202, 롤백도 롤아웃이다
+POST {{host}}/rollouts/{{rollout}}/rollback
+Content-Type: application/json
+
+{
+  "fleet_id": "{{fleet}}",
+  "new_rollout_id": "ro-1-rollback",
+  "reason": "v2.0.0 배포 후 FAULT 재현율 붕괴",
+  "to_version": "v1.0.0",
+  "occurred_at": "2026-05-25 09:00:00"
+}
+
+### 6-10  계보 — 이 디바이스의 모델이 어느 데이터에서 왔는가
+POST {{host}}/fleets/{{fleet}}/devices/DEV-00/lineage
+Content-Type: application/json
+
+{
+  "source_devices": ["DEV-00", "DEV-01", "DEV-02"],
+  "window": "2026-05-22 00:00:00 ~ 2026-05-23 23:59:59"
+}
+
+### 6-11  오래 연락 없는 디바이스를 표시한다
+POST {{host}}/fleets/{{fleet}}/sweep
+Content-Type: application/json
+
+{
+  "now": "2026-05-25 09:00:00",
+  "stale_after": "2026-05-24 09:00:00",
+  "unreachable_after": "2026-05-23 09:00:00"
+}
+
+### 롤아웃 목록
+GET {{host}}/rollouts
+
+### 롤아웃 하나
+GET {{host}}/rollouts/{{rollout}}
+
+
+# =============================================================================
+# 확장 실습 (1-11, 2-11, 3-11~3-15, 4-11~4-14, 6-12~6-14)
+# =============================================================================
+
+### 1-11  수집 주기를 실제로 뽑아 보고 고른다
+POST {{host}}/datasets/{{dataset}}/sampling-design
+Content-Type: application/json
+
+{
+  "plans": [
+    {"interval_seconds": 10, "retention_days": 30},
+    {"interval_seconds": 20, "retention_days": 30},
+    {"interval_seconds": 30, "retention_days": 30},
+    {"interval_seconds": 60, "retention_days": 30},
+    {"interval_seconds": 300, "retention_days": 30}
+  ],
+  "value_field": "active_power_kw",
+  "target_event_seconds": 60.0,
+  "min_samples_per_event": 5.0
+}
+
+### 1-11  해상도를 굵게 잡으면 무엇이 사라지는가
+POST {{host}}/datasets/{{dataset}}/sampling-design
+Content-Type: application/json
+
+{
+  "plans": [
+    {"interval_seconds": 10, "value_resolution": 0.1},
+    {"interval_seconds": 10, "value_resolution": 50.0}
+  ],
+  "value_field": "active_power_kw"
+}
+
+### 2-11  불균형 완화 전략마다 무엇을 잃는가
+POST {{host}}/datasets/{{dataset}}/rebalancing-comparison
+Content-Type: application/json
+
+{
+  "plans": [
+    {"strategy": "NONE"},
+    {"strategy": "CLASS_WEIGHT"},
+    {"strategy": "OVERSAMPLE"},
+    {"strategy": "UNDERSAMPLE"},
+    {"strategy": "SYNTHETIC"},
+    {"strategy": "OVERSAMPLE", "applied_after_split": false}
+  ]
+}
+
+### 3-11  이미지 학습을 준비한다 (게이트가 여기서 막는다)
+POST {{host}}/models/image-training-runs
+Content-Type: application/json
+
+{
+  "run_id": "run-casting",
+  "dataset_ref": "castings",
+  "root_uri": "data/samples/castings-train",
+  "spec": {"width": 48, "height": 48, "channels": 3},
+  "class_count": 2,
+  "hidden_channels": [16, 32],
+  "kernel_size": 3,
+  "pooling": "AVERAGE",
+  "epochs": 25
+}
+
+### 3-11  작은 결함은 평균에 묻힌다 — MAX 풀링으로 다시
+POST {{host}}/models/image-training-runs
+Content-Type: application/json
+
+{
+  "run_id": "run-food-max",
+  "dataset_ref": "food",
+  "root_uri": "data/samples/food",
+  "spec": {"width": 48, "height": 48, "channels": 3},
+  "class_count": 3,
+  "pooling": "MAX",
+  "epochs": 25
+}
+
+### 3-11  학습을 시작한다 (202 — 오래 걸린다)
+POST {{host}}/models/image-training-runs/run-casting/execution
+
+### 3-12 / 3-14 / 3-15  실험을 나란히 놓는다
+POST {{host}}/models/experiments/comparison
+Content-Type: application/json
+
+{
+  "name": "창 길이를 바꿔 보았다",
+  "trials": [
+    {"run_id": "run-win15",  "label": "창 15",  "knobs": {"window": "15"}},
+    {"run_id": "run-win30",  "label": "창 30",  "knobs": {"window": "30"}},
+    {"run_id": "run-win60",  "label": "창 60",  "knobs": {"window": "60"}},
+    {"run_id": "run-win120", "label": "창 120", "knobs": {"window": "120"}}
+  ],
+  "metric": "macro_f1",
+  "noise_band": 0.02,
+  "min_evaluated_samples": 60
+}
+
+### 3-13  통계 기준선을 먼저 재 본다
+POST {{host}}/models/{{run}}/baseline-comparison
+Content-Type: application/json
+
+{
+  "method": "THREE_SIGMA",
+  "threshold": 1.5,
+  "min_flagged_ratio": 0.1,
+  "normal_label": "NORMAL",
+  "min_recall_gain": 0.05
+}
+
+### 4-11  구조를 줄이는 것과 숫자를 줄이는 것은 다르다
+POST {{host}}/optimization-runs/{{optimization}}/structural-reduction
+Content-Type: application/json
+
+{
+  "reductions": [
+    {"label": "폭 절반 · 재학습 없음", "kind": "WIDTH", "ratio": 0.5},
+    {"label": "폭 절반 · 재학습", "kind": "WIDTH", "ratio": 0.5, "fine_tuned": true},
+    {"label": "가지치기 50%", "kind": "PRUNE_UNSTRUCTURED", "ratio": 0.5},
+    {"label": "가지치기 50% · 미세조정", "kind": "PRUNE_UNSTRUCTURED", "ratio": 0.5, "fine_tuned": true}
+  ],
+  "fine_tune_epochs": 25
+}
+
+### 4-12  PTQ 로 충분한가 (8비트)
+POST {{host}}/optimization-runs/{{optimization}}/quantization-comparison
+Content-Type: application/json
+
+{"bits": 8, "epochs": 12, "per_channel": true}
+
+### 4-12  무너지는 지점에서 QAT 가 되찾는가 (2비트)
+POST {{host}}/optimization-runs/{{optimization}}/quantization-comparison
+Content-Type: application/json
+
+{"bits": 2, "epochs": 12, "per_channel": true}
+
+### 4-13  CPU 와 메모리를 실제로 잰다
+POST {{host}}/optimization-runs/{{optimization}}/resource-usage
+Content-Type: application/json
+
+{
+  "warmup_runs": 20,
+  "measured_runs": 150,
+  "batch_size": 1,
+  "threads": 1,
+  "max_rss_bytes": 268435456,
+  "max_cores": 1.0
+}
+
+### 4-14  한 장씩 볼 때와 묶어서 볼 때
+POST {{host}}/optimization-runs/{{optimization}}/batch-scaling
+Content-Type: application/json
+
+{
+  "label": "TFLITE/FP32",
+  "batch_sizes": [1, 4, 16, 64],
+  "cycle_time_ms": 30.0
+}
+
+### 6-12  실험을 S3 에 남긴다
+POST {{host}}/experiments/window-length-sweep/trials
+Content-Type: application/json
+
+{
+  "records": [
+    {
+      "trial_id": "win30",
+      "dataset_version": "power-2026-05-11",
+      "code_version": "a1b2c3d",
+      "parameters": {"window": "30", "stride": "30", "lr": "3e-3", "seed": "42"},
+      "metrics": {"macro_f1": 0.94, "accuracy": 0.96},
+      "artifact_uri": "s3://ondevice-ai-lake/experiments/window-length-sweep/artifacts/win30.tar.gz",
+      "created_at": "2026-05-23T09:00:00"
+    }
+  ]
+}
+
+### 6-12  다시 만들 수 있는지 확인한다
+GET {{host}}/experiments/window-length-sweep
+
+### 6-13  기본값 그대로인 버킷을 본다
+GET {{host}}/storage/governance
+
+### 6-13  버전과 권한을 건다
+PUT {{host}}/storage/governance
+Content-Type: application/json
+
+{
+  "versioning": true,
+  "encryption": "AES256",
+  "block_public_access": true,
+  "expiration_days": 365,
+  "statements": [
+    {
+      "sid": "TrainingJobReadWrite",
+      "effect": "Allow",
+      "principal": "arn:aws:iam::123456789012:role/ondevice-ai-training",
+      "actions": ["s3:GetObject", "s3:PutObject"],
+      "resources": ["arn:aws:s3:::ondevice-ai-lake/datasets/*"]
+    }
+  ],
+  "version_prefix": "models/"
+}
+
+### 6-14  실시간 추론 엔드포인트를 띄운다 (판정이 함께 온다)
+POST {{host}}/endpoints
+Content-Type: application/json
+
+{
+  "name": "line3-inspection",
+  "variants": [
+    {
+      "name": "AllTraffic",
+      "model_reference": "models/line3/v1.3.0/model.tar.gz",
+      "instance_type": "ml.m5.large",
+      "instance_count": 1,
+      "hourly_cost_usd": 0.115
+    }
+  ],
+  "cycle_time_ms": 30.0,
+  "network_round_trip_ms": 42.0,
+  "inference_ms": 6.0,
+  "offline_tolerance_minutes": 0.0,
+  "requests_per_hour": 30
+}
+
+### 6-14  **실습이 끝나면 반드시 지운다** — 켜 두면 시간당 과금된다
+DELETE {{host}}/endpoints/line3-inspection

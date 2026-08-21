@@ -1,0 +1,15 @@
+# 보드에 올라가는 것만 적는다.
+#
+# **여기에 pandas·torch·tensorflow 가 없다.** 그게 요점이다 —
+# 판정 코드(domain)에 프레임워크가 하나도 없기 때문에 (CLAUDE.md §14, §15)
+# 보드에는 numpy 와 추론 런타임만 있으면 된다.
+
+numpy>=1.26
+
+# 추론 런타임 — 보드에서는 이것을 쓴다 (수십 MB)
+#   pip install tflite-runtime
+# 개발 기계에서는 백엔드가 이미 가진 ai-edge-litert 로 대신한다.
+
+# 선택 — 실제 하드웨어를 붙일 때만
+# pyserial>=3.5      SerialSensorSource
+# opencv-python>=4.9 CameraSource
